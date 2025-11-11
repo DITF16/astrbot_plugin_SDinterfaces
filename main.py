@@ -1,14 +1,11 @@
-import asyncio
 import re
-
 import aiohttp
 
 from astrbot.api.all import *
 
-
 TEMP_PATH = os.path.abspath("data/temp")
 
-@register("SDGen", "buding(AstrBot)", "Stable Diffusion图像生成器", "1.1.2")
+
 class SDGenerator(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -21,6 +18,9 @@ class SDGenerator(Star):
         self.active_tasks = 0
         self.max_concurrent_tasks = config.get("max_concurrent_tasks", 10)  # 设定最大并发数
         self.task_semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
+
+        # 优化：添加资源缓存
+        self.resource_cache = {}
 
     def _validate_config(self):
         """配置验证"""
@@ -40,13 +40,20 @@ class SDGenerator(Star):
             )
 
     async def _fetch_webui_resource(self, resource_type: str) -> list:
-        """从 WebUI API 获取指定类型的资源列表"""
+        """从 WebUI API 获取指定类型的资源列表 (带缓存)"""
+
+        # 优化：检查缓存
+        if resource_type in self.resource_cache:
+            logger.debug(f"从缓存加载 {resource_type} 资源")
+            return self.resource_cache[resource_type]
+
         endpoint_map = {
             "model": "/sdapi/v1/sd-models",
             "embedding": "/sdapi/v1/embeddings",
             "lora": "/sdapi/v1/loras",
             "sampler": "/sdapi/v1/samplers",
-            "upscaler": "/sdapi/v1/upscalers"
+            "upscaler": "/sdapi/v1/upscalers",
+            "vae": "/sdapi/v1/sd-vae"  # 新增：VAE 接口
         }
         if resource_type not in endpoint_map:
             logger.error(f"无效的资源类型: {resource_type}")
@@ -57,23 +64,20 @@ class SDGenerator(Star):
             async with self.session.get(f"{self.config['webui_url']}{endpoint_map[resource_type]}") as resp:
                 if resp.status == 200:
                     resources = await resp.json()
+                    resource_names = []
 
                     # 按不同类型解析返回数据
-                    if resource_type == "model":
+                    if resource_type in ["model", "vae"]:
                         resource_names = [r["model_name"] for r in resources if "model_name" in r]
                     elif resource_type == "embedding":
                         resource_names = list(resources.get('loaded', {}).keys())
-                    elif resource_type == "lora":
+                    elif resource_type in ["lora", "sampler", "upscaler"]:
                         resource_names = [r["name"] for r in resources if "name" in r]
-                    elif resource_type == "sampler":
-                        resource_names = [r["name"] for r in resources if "name" in r]
-                    elif resource_type == "upscaler":
-                        resource_names = [r["name"] for r in resources if "name" in r]
-
-                    else:
-                        resource_names = []
 
                     logger.debug(f"从 WebUI 获取到的{resource_type}资源: {resource_names}")
+
+                    # 优化：存入缓存
+                    self.resource_cache[resource_type] = resource_names
                     return resource_names
         except Exception as e:
             logger.error(f"获取 {resource_type} 类型资源失败: {e}")
@@ -97,11 +101,18 @@ class SDGenerator(Star):
         """获取可用的上采样算法列表"""
         return await self._fetch_webui_resource("upscaler")
 
+    async def _get_vae_list(self):
+        """获取可用的 VAE 列表"""
+        return await self._fetch_webui_resource("vae")
+
     async def _generate_payload(self, prompt: str) -> dict:
-        """构建生成参数"""
+        """
+        优化：构建生成参数 (实现原生 Hires. fix)
+        """
         params = self.config["default_params"]
 
-        return {
+        # 基础 payload
+        payload = {
             "prompt": prompt,
             "negative_prompt": self.config["negative_prompt_global"],
             "width": params["width"],
@@ -111,7 +122,32 @@ class SDGenerator(Star):
             "cfg_scale": params["cfg_scale"],
             "batch_size": params["batch_size"],
             "n_iter": params["n_iter"],
+            "seed": params.get("seed", -1),
         }
+
+        # 检查是否启用 "高分修复" (Hires. fix)
+        if self.config.get("enable_upscale", False):
+            # API 文档 (StableDiffusionProcessingTxt2Img)
+            # 要求我们添加 Hires. fix 特定参数
+            hr_params = {
+                "enable_hr": True,
+                "hr_scale": params.get("upscale_factor", 2),  # 对应配置中的 "upscale_factor"
+                "hr_upscaler": params.get("upscaler", "Latent"),
+                "hr_second_pass_steps": params.get("hr_second_pass_steps", 10),
+                "denoising_strength": params.get("denoising_strength", 0.4)
+            }
+            payload.update(hr_params)
+            logger.debug(f"Hires. fix 已启用, 添加参数: {hr_params}")
+
+        # 添加 override_settings (用于 Clip Skip 和 VAE)
+        override_settings = {
+            "CLIP_stop_at_last_layers": params.get("clip_skip", 2),
+            "sd_vae": params.get("sd_vae", "Automatic")
+        }
+        payload["override_settings"] = override_settings
+        logger.debug(f"Override settings: {override_settings}")
+
+        return payload
 
     def _trans_prompt(self, prompt: str) -> str:
         """
@@ -119,9 +155,6 @@ class SDGenerator(Star):
         """
         replace_space = self.config.get("replace_space")
         return prompt.replace(replace_space, " ")
-    
-
-
 
     async def _generate_prompt(self, prompt: str) -> str:
         provider = self.context.get_using_provider()
@@ -165,36 +198,12 @@ class SDGenerator(Star):
         payload = await self._generate_payload(prompt)
         return await self._call_sd_api("/sdapi/v1/txt2img", payload)
 
-    async def _apply_image_processing(self, image_origin: str) -> str:
-        """统一处理高分辨率修复与超分辨率放大"""
-
-        # 获取配置参数
-        params = self.config["default_params"]
-        upscale_factor = params["upscale_factor"] or "2"
-        upscaler = params["upscaler"] or "未设置"
-
-        # 根据配置构建payload
-        payload = {
-            "image": image_origin,
-            "upscaling_resize": upscale_factor,  # 使用配置的放大倍数
-            "upscaler_1": upscaler,  # 使用配置的上采样算法
-            "resize_mode": 0,  # 标准缩放模式
-            "show_extras_results": True,  # 显示额外结果
-            "upscaling_resize_w": 1,  # 自动计算宽度
-            "upscaling_resize_h": 1,  # 自动计算高度
-            "upscaling_crop": False,  # 不裁剪图像
-            "gfpgan_visibility": 0,  # 不使用人脸修复
-            "codeformer_visibility": 0,  # 不使用CodeFormer修复
-            "codeformer_weight": 0,  # 不使用CodeFormer权重
-            "extras_upscaler_2_visibility": 0  # 不使用额外的上采样算法
-        }
-
-        resp = await self._call_sd_api("/sdapi/v1/extra-single-image", payload)
-        return resp["image"]
+    # 优化：移除 _apply_image_processing 函数，Hires. fix 已在 _generate_payload 中处理
 
     async def _set_model(self, model_name: str) -> bool:
         """设置图像生成模型，并存入 config"""
         try:
+            # 优化：使用 /sdapi/v1/options 接口设置模型
             async with self.session.post(
                     f"{self.config['webui_url']}/sdapi/v1/options",
                     json={"sd_model_checkpoint": model_name}
@@ -216,7 +225,8 @@ class SDGenerator(Star):
         """服务状态检查"""
         try:
             await self.ensure_session()
-            async with self.session.get(f"{self.config['webui_url']}/sdapi/v1/progress") as resp:
+            # 优化：使用 /internal/ping 接口检查 (更快)
+            async with self.session.get(f"{self.config['webui_url']}/internal/ping") as resp:
                 if resp.status == 200:
                     return True, 0
                 else:
@@ -240,36 +250,47 @@ class SDGenerator(Star):
         batch_size = params.get("batch_size") or "未设置"
         n_iter = params.get("n_iter") or "未设置"
 
+        # 新增
+        seed = params.get("seed", -1)
+        clip_skip = params.get("clip_skip", 2)
+        sd_vae = params.get("sd_vae", "Automatic")
         base_model = self.config.get("base_model").strip() or "未设置"
 
         return (
             f"- 全局正面提示词: {positive_prompt_global}\n"
             f"- 全局负面提示词: {negative_prompt_global}\n"
             f"- 基础模型: {base_model}\n"
+            f"- VAE: {sd_vae}\n"
             f"- 图片尺寸: {width}x{height}\n"
             f"- 步数: {steps}\n"
             f"- 采样器: {sampler}\n"
             f"- CFG比例: {cfg_scale}\n"
+            f"- 种子: {seed}\n"
+            f"- Clip Skip: {clip_skip}\n"
             f"- 批数量: {batch_size}\n"
             f"- 迭代次数: {n_iter}"
         )
 
     def _get_upscale_params(self) -> str:
-        """获取当前图像增强（超分辨率放大）参数"""
+        """优化：获取当前 Hires. fix 参数"""
         params = self.config["default_params"]
-        upscale_factor = params["upscale_factor"] or "2"
-        upscaler = params["upscaler"] or "未设置"
+        upscale_factor = params.get("upscale_factor", "未设置")
+        upscaler = params.get("upscaler", "未设置")
+        denoising = params.get("denoising_strength", "未设置")
+        hr_steps = params.get("hr_second_pass_steps", "未设置")
 
         return (
-            f"- 放大倍数: {upscale_factor}\n"
-            f"- 上采样算法: {upscaler}"
+            f"- 放大倍数 (hr_scale): {upscale_factor}\n"
+            f"- 上采样算法 (hr_upscaler): {upscaler}\n"
+            f"- 重绘幅度 (denoising_strength): {denoising}\n"
+            f"- 修复步数 (hr_second_pass_steps): {hr_steps}"
         )
 
-    @command_group("sd")
+    @command_group("绘图")
     def sd(self):
         pass
 
-    @sd.command("check")
+    @sd.command("检查")
     async def check(self, event: AstrMessageEvent):
         """服务状态检查"""
         try:
@@ -277,12 +298,19 @@ class SDGenerator(Star):
             if webui_available:
                 yield event.plain_result("✅ 同Webui连接正常")
             else:
-                yield event.plain_result(f"❌ 同Webui无连接，请检查配置和Webui工作状态")
+                yield event.plain_result(f"❌ 同Webui无连接 (状态码: {status})，请检查配置和Webui工作状态")
         except Exception as e:
             logger.error(f"❌ 检查可用性错误，报错{e}")
             yield event.plain_result("❌ 检查可用性错误，请检查日志")
 
-    @sd.command("gen")
+    @sd.command("刷新")
+    async def refresh_cache(self, event: AstrMessageEvent):
+        """清除资源缓存 (模型/采样器/VAE等)"""
+        self.resource_cache = {}
+        logger.info("SD 插件资源缓存已清除")
+        yield event.plain_result("✅ 资源缓存已清除。下次列表查询将从 WebUI 重新获取。")
+
+    @sd.command("画")
     async def generate_image(self, event: AstrMessageEvent, prompt: str):
         """生成图像指令
         Args:
@@ -301,67 +329,47 @@ class SDGenerator(Star):
                     yield event.plain_result("🖌️ 生成图像阶段，这可能需要一段时间...")
 
                 # 生成提示词
-                
+
                 if self.config.get("enable_generate_prompt"):
                     generated_prompt = await self._generate_prompt(prompt)
                     logger.debug(f"LLM generated prompt: {generated_prompt}")
-                    enable_positive_prompt_add_in_head_or_tail = self.config.get("enable_positive_prompt_add_in_head_or_tail",True)
+                    enable_positive_prompt_add_in_head_or_tail = self.config.get(
+                        "enable_positive_prompt_add_in_head_or_tail", True)
                     if enable_positive_prompt_add_in_head_or_tail:
                         positive_prompt = self.config.get("positive_prompt_global", "") + generated_prompt
-                    
+
                     else:
                         positive_prompt = generated_prompt + self.config.get("positive_prompt_global", "")
                 else:
-                    enable_positive_prompt_add_in_head_or_tail = self.config.get("enable_positive_prompt_add_in_head_or_tail",True)
+                    enable_positive_prompt_add_in_head_or_tail = self.config.get(
+                        "enable_positive_prompt_add_in_head_or_tail", True)
                     if enable_positive_prompt_add_in_head_or_tail:
                         positive_prompt = self.config.get("positive_prompt_global", "") + self._trans_prompt(prompt)
                     else:
                         positive_prompt = self._trans_prompt(prompt) + self.config.get("positive_prompt_global", "")
-                    
 
-                #输出正向提示词
+                # 输出正向提示词
                 if self.config.get("enable_show_positive_prompt", False):
                     yield event.plain_result(f"正向提示词：{positive_prompt}")
 
-                # 生成图像
+                # 生成图像 (Hires. fix 已包含在内)
                 response = await self._call_t2i_api(positive_prompt)
                 if not response.get("images"):
                     raise ValueError("API返回数据异常：生成图像失败")
 
                 images = response["images"]
 
+                # 优化：移除 _apply_image_processing 调用
+
                 if len(images) == 1:
-
-                    image_data = response["images"][0]
-
-                    image_bytes = base64.b64decode(image_data)
-                    image = base64.b64encode(image_bytes).decode("utf-8")
-
-                    # 图像处理
-                    if self.config.get("enable_upscale"):
-                        if verbose:
-                            yield event.plain_result("🖼️ 处理图像阶段，即将结束...")
-                        image = await self._apply_image_processing(image)
-
-                    yield event.chain_result([Image.fromBase64(image)])
+                    # [修复] 直接将 API 返回的 base64 字符串传递给 Image.fromBase64
+                    image_data_str = response["images"][0]
+                    yield event.chain_result([Image.fromBase64(image_data_str)])
                 else:
                     chain = []
-
-                    if self.config.get("enable_upscale") and verbose:
-                        yield event.plain_result("🖼️ 处理图像阶段，即将结束...")
-
-                    for image_data in images:
-                        image_bytes = base64.b64decode(image_data)
-                        image = base64.b64encode(image_bytes).decode("utf-8")
-
-                        # 图像处理
-                        if self.config.get("enable_upscale"):
-                            image = await self._apply_image_processing(image)
-
-                        # 添加到链对象
-                        chain.append(Image.fromBase64(image))
-
-                    # 将链式结果发送给事件
+                    for image_data_str in images:
+                        # [修复] 直接将 API 返回的 base64 字符串传递给 Image.fromBase64
+                        chain.append(Image.fromBase64(image_data_str))
                     yield event.chain_result(chain)
 
                 if verbose:
@@ -389,7 +397,7 @@ class SDGenerator(Star):
             finally:
                 self.active_tasks -= 1
 
-    @sd.command("verbose")
+    @sd.command("详细")
     async def set_verbose(self, event: AstrMessageEvent):
         """切换详细输出模式（verbose）"""
         try:
@@ -408,9 +416,9 @@ class SDGenerator(Star):
             logger.error(f"切换详细输出模式失败: {e}")
             yield event.plain_result("❌ 切换详细模式失败，请检查日志")
 
-    @sd.command("upscale")
+    @sd.command("高清")
     async def set_upscale(self, event: AstrMessageEvent):
-        """设置图像增强模式（enable_upscale）"""
+        """(Hires. fix) 切换高分修复模式"""
         try:
             # 获取当前的 upscale 配置值
             current_upscale = self.config.get("enable_upscale", False)
@@ -424,13 +432,13 @@ class SDGenerator(Star):
 
             # 发送反馈消息
             status = "开启" if new_upscale else "关闭"
-            yield event.plain_result(f"📢 图像增强模式已{status}")
+            yield event.plain_result(f"📢 Hires. fix (高分修复) 模式已{status}")
 
         except Exception as e:
-            logger.error(f"切换图像增强模式失败: {e}")
-            yield event.plain_result("❌ 切换图像增强模式失败，请检查日志")
+            logger.error(f"切换 Hires. fix 模式失败: {e}")
+            yield event.plain_result("❌ 切换 Hires. fix 模式失败，请检查日志")
 
-    @sd.command("LLM")
+    @sd.command("llm")
     async def set_generate_prompt(self, event: AstrMessageEvent):
         """切换生成提示词功能"""
         try:
@@ -445,7 +453,7 @@ class SDGenerator(Star):
             logger.error(f"切换生成提示词功能失败: {e}")
             yield event.plain_result("❌ 切换生成提示词功能失败，请检查日志")
 
-    @sd.command("prompt")
+    @sd.command("提示词")
     async def set_show_prompt(self, event: AstrMessageEvent):
         """切换显示正向提示词功能"""
         try:
@@ -460,7 +468,7 @@ class SDGenerator(Star):
             logger.error(f"切换显示正向提示词功能失败: {e}")
             yield event.plain_result("❌ 切换显示正向提示词功能失败，请检查日志")
 
-    @sd.command("timeout")
+    @sd.command("超时")
     async def set_timeout(self, event: AstrMessageEvent, time: int):
         """设置会话超时时间"""
         try:
@@ -471,17 +479,21 @@ class SDGenerator(Star):
             self.config["session_timeout_time"] = time
             self.config.save_config()
 
+            # 重新初始化 session
+            self.session = None
+            await self.ensure_session()
+
             yield event.plain_result(f"⏲️ 会话超时时间已设置为 {time} 秒")
         except Exception as e:
             logger.error(f"设置会话超时时间失败: {e}")
             yield event.plain_result("❌ 设置会话超时时间失败，请检查日志")
 
-    @sd.command("conf")
+    @sd.command("配置")
     async def show_conf(self, event: AstrMessageEvent):
         """打印当前图像生成参数，包括当前使用的模型"""
         try:
             gen_params = self._get_generation_params()  # 获取当前图像参数
-            scale_params = self._get_upscale_params()   # 获取图像增强参数
+            scale_params = self._get_upscale_params()  # 获取图像增强参数
             prompt_guidelines = self.config.get("prompt_guidelines").strip() or "未设置"  # 获取提示词限制
 
             verbose = self.config.get("verbose", True)  # 获取详略模式
@@ -491,10 +503,10 @@ class SDGenerator(Star):
 
             conf_message = (
                 f"⚙️  图像生成参数:\n{gen_params}\n\n"
-                f"🔍  图像增强参数:\n{scale_params}\n\n"
+                f"🔍  Hires. fix (高分修复) 参数:\n{scale_params}\n\n"
                 f"🛠️  提示词附加要求: {prompt_guidelines}\n\n"
                 f"📢  详细输出模式: {'开启' if verbose else '关闭'}\n\n"
-                f"🔧  图像增强模式: {'开启' if upscale else '关闭'}\n\n"
+                f"🔧  Hires. fix 模式: {'开启' if upscale else '关闭'}\n\n"
                 f"📝  正向提示词显示: {'开启' if show_positive_prompt else '关闭'}\n\n"
                 f"🤖  提示词生成模式: {'开启' if generate_prompt else '关闭'}"
             )
@@ -504,54 +516,60 @@ class SDGenerator(Star):
             logger.error(f"获取生成参数失败: {e}")
             yield event.plain_result("❌ 获取图像生成参数失败，请检查配置是否正确")
 
-    @sd.command("help")
+    @sd.command("帮助")
     async def show_help(self, event: AstrMessageEvent):
-        """显示SDGenerator插件所有可用指令及其描述"""
+        """(优化) 显示SDGenerator插件所有可用指令及其描述"""
         help_msg = [
-            "🖼️ **Stable Diffusion 插件帮助指南**",
-            "该插件用于调用 Stable Diffusion WebUI 的 API 生成图像并管理相关模型资源。",
+            "🖼️ **Stable Diffusion 插件帮助指南 (v2.0 优化版)**",
+            "调用 Stable Diffusion WebUI API 生成图像。",
             "",
-            "📜 **主要功能指令**:",
-            "- `/sd gen [提示词]`：生成图片，例如 `/sd gen 星空下的城堡`。",
-            "- `/sd check`：检查 WebUI 的连接状态。",
-            "- `/sd conf`：显示当前使用配置，包括模型、参数和提示词设置。",
-            "- `/sd help`：显示本帮助信息。",
+            "📜 **核心指令**:",
+            "- `/绘图 画 [提示词]`：生成图片。 (示例: `/绘图 画 星空下的城堡`)",
+            "- `/绘图 配置`：显示当前所有生效的配置参数。",
+            "- `/绘图 检查`：检查 WebUI 的连接状态。",
+            "- `/绘图 刷新`：清除插件的模型/VAE/采样器缓存 (添加新模型后使用)。",
+            "- `/绘图 帮助`：显示本帮助信息。",
             "",
-            "🔧 **高级功能指令**:",
-            "- `/sd verbose`：切换详细输出模式，用于实时告知目前AI生图进行到了哪个阶段。",
-            "- `/sd upscale`：切换图像增强模式（用于超分辨率放大或高分修复）。",
-            "- `/sd LLM`：在使用/sd gen指令时，将内容先发送给LLM，再由LLM来生成正向提示词",
-            "- `/sd prompt`：开启时，用户发起AI生图请求后，将发送一条消息，内容为送入到Stable diffusion的正向提示词",
-            "- `/sd timeout [秒数]`：设置连接超时时间（建议范围：10 到 300 秒）。",
-            "- `/sd res  [宽度] [高度]`：设置图像生成的分辨率（高度和宽度均支持:1-2048之间的任意整数）。",
-            "- `/sd step [步数]`：设置图像生成的步数（范围：10 到 50 步）。",
-            "- `/sd batch [数量]`：设置发出AI生图请求后，每轮生成的图片数量（范围： 1 到 10 张）。"
-            "- `/sd iter [次数]`：设置迭代次数（范围： 1 到 5 次）。"
+            "⚙️ **生成参数指令**:",
+            "- `/绘图 尺寸 [宽度] [高度]`：设置基础分辨率 (1-2048)。",
+            "- `/绘图 步数 [步数]`：设置采样步数 (10-50)。",
+            "- `/绘图 种子 [数字]`：设置种子 (-1 为随机)。",
+            "- `/绘图 clip [数字]`：设置 Clip Skip (推荐 1 或 2)。",
+            "- `/绘图 批量 [数量]`：设置每轮生成的图片数量 (1-10)。",
+            "- `/绘图 迭代 [次数]`：设置迭代次数 (1-5)。",
             "",
-            "🖼️ **基本模型与微调模型指令**:",
-            "- `/sd model list`：列出 WebUI 当前可用的模型。",
-            "- `/sd model set [索引]`：利用索引设置模型，索引可通过 `model list` 查询。",
-            "- `/sd lora`：列出所有可用的 LoRA 模型。",
-            "- `/sd embedding`：显示所有已加载的 Embedding 模型。",
+            "✨ **Hires. fix (高分修复) 指令**:",
+            "- `/绘图 高清`：切换 Hires. fix (高分修复) 功能 [开启/关闭]。",
+            "- `/绘图 h倍数 [倍数]`：设置 Hires. fix 放大倍数 (例如 1.5, 2)。",
+            "- `/绘图 重绘 [幅度]`：设置 Hires. fix 重绘幅度 (0.0-1.0, 推荐 0.4)。",
+            "- `/绘图 h步数 [步数]`：设置 Hires. fix 修复步数 (0-100, 0为自动)。",
+            "- `/绘图 放大器 设置 [索引]`：设置 Hires. fix 使用的上采样算法。",
             "",
-            "🎨 **采样器与上采样算法指令**:",
-            "- `/sd sampler list`：列出支持的采样器。",
-            "- `/sd sampler set [索引]`：根据索引配置采样器，用于调整生成效果。",
-            "- `/sd upscaler list`：列出支持的上采样算法。",
-            "- `/sd upscaler set [索引]`：根据索引设置上采样算法。",
+            "🎛️ **资源设置指令**:",
+            "- `/绘图 模型 列表` / `设置 [索引]`：查看或切换基础模型。",
+            "- `/绘图 vae 列表` / `设置 [索引]`：查看或切换 VAE。",
+            "- `/绘图 采样器 列表` / `设置 [索引]`：查看或切换采样器。",
+            "- `/绘图 放大器 列表`：查看可用的上采样算法。",
+            "- `/绘图 lora`：(只读) 列出可用的 LoRA 模型。",
+            "- `/绘图 embedding`：(只读) 显示已加载的 Embedding。",
+            "",
+            "🤖 **模式切换指令**:",
+            "- `/绘图 llm`：切换 [LLM生成提示词 / 用户直出提示词] 模式。",
+            "- `/绘图 详细`：切换 [详细输出 / 简洁输出] 模式。",
+            "- `/绘图 提示词`：切换 [显示最终提示词 / 不显示] 模式。",
+            "- `/绘图 超时 [秒数]`：设置连接超时时间 (10-300)。",
             "",
             "ℹ️ **注意事项**:",
-            "- 如启用自动生成提示词功能，则会使用 LLM 利用提供的内容来生成提示词。",
-            "- 如未启用自动生成提示词功能，若提供的自定义提示词中包含空格，则应使用 “~”（英文波浪号） 替代所有提示词中的空格，否则输入的自定义提示词组将在空格处中断。你可以在配置中修改想使用的字符。",
-            "- 模型、采样器和其他资源的索引需要使用对应 `list` 命令获取后设置！",
+            "- 提示词中的空格请用 `~` (波浪号) 替代, 或在配置中修改该字符。",
         ]
         yield event.plain_result("\n".join(help_msg))
 
-    @sd.command("res")
-    async def set_resolution(self, event: AstrMessageEvent, width: int,height: int ):
+    @sd.command("尺寸")
+    async def set_resolution(self, event: AstrMessageEvent, width: int, height: int):
         """设置分辨率"""
         try:
-            if not isinstance(height, int) or not isinstance(width, int) or height < 1 or width < 1 or height > 2048 or width > 2048:
+            if not isinstance(height, int) or not isinstance(width,
+                                                             int) or height < 1 or width < 1 or height > 2048 or width > 2048:
                 yield event.plain_result("⚠️ 分辨率仅支持:1-2048之间的任意整数")
                 return
 
@@ -564,7 +582,7 @@ class SDGenerator(Star):
             logger.error(f"设置分辨率失败: {e}")
             yield event.plain_result("❌ 设置分辨率失败，请检查日志")
 
-    @sd.command("step")
+    @sd.command("步数")
     async def set_step(self, event: AstrMessageEvent, step: int):
         """设置步数"""
         try:
@@ -580,7 +598,80 @@ class SDGenerator(Star):
             logger.error(f"设置步数失败: {e}")
             yield event.plain_result("❌ 设置步数失败，请检查日志")
 
-    @sd.command("batch")
+    # --- 新增命令 ---
+
+    @sd.command("种子")
+    async def set_seed(self, event: AstrMessageEvent, seed: int):
+        """设置种子 (-1为随机)"""
+        try:
+            self.config["default_params"]["seed"] = int(seed)
+            self.config.save_config()
+            yield event.plain_result(f"✅ 种子已设置为: {seed}")
+        except Exception as e:
+            logger.error(f"设置种子失败: {e}")
+            yield event.plain_result("❌ 设置种子失败，请检查日志")
+
+    @sd.command("clip")
+    async def set_clip_skip(self, event: AstrMessageEvent, skip: int):
+        """设置 Clip Skip"""
+        try:
+            if skip < 1 or skip > 12:
+                yield event.plain_result("⚠️ Clip Skip 建议设置在 1 到 12 之间 (通常为 1 或 2)")
+                return
+            self.config["default_params"]["clip_skip"] = skip
+            self.config.save_config()
+            yield event.plain_result(f"✅ Clip Skip 已设置为: {skip}")
+        except Exception as e:
+            logger.error(f"设置 Clip Skip 失败: {e}")
+            yield event.plain_result("❌ 设置 Clip Skip 失败，请检查日志")
+
+    @sd.command("重绘")
+    async def set_denoising(self, event: AstrMessageEvent, strength: float):
+        """设置 Hires. fix 的重绘幅度"""
+        try:
+            strength = float(strength)
+            if not (0.0 <= strength <= 1.0):
+                yield event.plain_result("⚠️ Hires. fix 重绘幅度必须在 0.0 到 1.0 之间")
+                return
+            self.config["default_params"]["denoising_strength"] = strength
+            self.config.save_config()
+            yield event.plain_result(f"✅ Hires. fix 重绘幅度已设置为: {strength}")
+        except Exception as e:
+            logger.error(f"设置重绘幅度失败: {e}")
+            yield event.plain_result("❌ 设置重绘幅度失败，请输入有效的小数 (例如 0.4)")
+
+    @sd.command("h步数")
+    async def set_hr_steps(self, event: AstrMessageEvent, steps: int):
+        """设置 Hires. fix 的修复步数"""
+        try:
+            if not (0 <= steps <= 100):
+                yield event.plain_result("⚠️ Hires. fix 步数必须在 0 到 100 之间 (0为自动)")
+                return
+            self.config["default_params"]["hr_second_pass_steps"] = steps
+            self.config.save_config()
+            yield event.plain_result(f"✅ Hires. fix 修复步数已设置为: {steps}")
+        except Exception as e:
+            logger.error(f"设置 Hires. fix 步数失败: {e}")
+            yield event.plain_result("❌ 设置 Hires. fix 步数失败，请检查日志")
+
+    @sd.command("h倍数")
+    async def set_hr_scale(self, event: AstrMessageEvent, scale: float):
+        """设置 Hires. fix 的放大倍数"""
+        try:
+            scale = float(scale)
+            if not (1.0 <= scale <= 8.0):
+                yield event.plain_result("⚠️ Hires. fix 放大倍数必须在 1.0 到 8.0 之间")
+                return
+            self.config["default_params"]["upscale_factor"] = scale
+            self.config.save_config()
+            yield event.plain_result(f"✅ Hires. fix 放大倍数已设置为: {scale}x")
+        except Exception as e:
+            logger.error(f"设置 Hires. fix 放大倍数失败: {e}")
+            yield event.plain_result("❌ 设置 Hires. fix 放大倍数失败，请输入有效的小数 (例如 1.5)")
+
+    # --- 结束新增命令 ---
+
+    @sd.command("批量")
     async def set_batch_size(self, event: AstrMessageEvent, batch_size: int):
         """设置批量生成的图片数量"""
         try:
@@ -596,7 +687,7 @@ class SDGenerator(Star):
             logger.error(f"设置批量生成数量失败: {e}")
             yield event.plain_result("❌ 设置图片生成批数量失败，请检查日志")
 
-    @sd.command("iter")
+    @sd.command("迭代")
     async def set_n_iter(self, event: AstrMessageEvent, n_iter: int):
         """设置生成迭代次数"""
         try:
@@ -612,11 +703,11 @@ class SDGenerator(Star):
             logger.error(f"设置生成迭代次数失败: {e}")
             yield event.plain_result("❌ 设置图片生成的迭代次数失败，请检查日志")
 
-    @sd.group("model")
+    @sd.group("模型")
     def model(self):
         pass
 
-    @model.command("list")
+    @model.command("列表")
     async def list_model(self, event: AstrMessageEvent):
         """
         以“1. xxx.safetensors“形式打印可用的模型
@@ -634,7 +725,7 @@ class SDGenerator(Star):
             logger.error(f"获取模型列表失败: {e}")
             yield event.plain_result("❌ 获取模型列表失败，请检查 WebUI 是否运行")
 
-    @model.command("set")
+    @model.command("设置")
     async def set_base_model(self, event: AstrMessageEvent, model_index: int):
         """
         解析用户输入的索引，并设置对应的模型
@@ -680,11 +771,11 @@ class SDGenerator(Star):
         except Exception as e:
             yield event.plain_result(f"获取 LoRA 模型列表失败: {str(e)}")
 
-    @sd.group("sampler")
+    @sd.group("采样器")
     def sampler(self):
         pass
 
-    @sampler.command("list")
+    @sampler.command("列表")
     async def list_sampler(self, event: AstrMessageEvent):
         """
         列出所有可用的采样器
@@ -700,7 +791,7 @@ class SDGenerator(Star):
         except Exception as e:
             yield event.plain_result(f"获取采样器列表失败: {str(e)}")
 
-    @sampler.command("set")
+    @sampler.command("设置")
     async def set_sampler(self, event: AstrMessageEvent, sampler_index: int):
         """
         设置采样器
@@ -727,11 +818,11 @@ class SDGenerator(Star):
         except Exception as e:
             yield event.plain_result(f"设置采样器失败: {str(e)}")
 
-    @sd.group("upscaler")
+    @sd.group("放大器")
     def upscaler(self):
         pass
 
-    @upscaler.command("list")
+    @upscaler.command("列表")
     async def list_upscaler(self, event: AstrMessageEvent):
         """
         列出所有可用的上采样算法
@@ -747,7 +838,7 @@ class SDGenerator(Star):
         except Exception as e:
             yield event.plain_result(f"获取上采样算法列表失败: {str(e)}")
 
-    @upscaler.command("set")
+    @upscaler.command("设置")
     async def set_upscaler(self, event: AstrMessageEvent, upscaler_index: int):
         """
         设置上采样算法
@@ -774,6 +865,52 @@ class SDGenerator(Star):
         except Exception as e:
             yield event.plain_result(f"设置上采样算法失败: {str(e)}")
 
+    # --- 新增 VAE 命令组 ---
+    @sd.group("vae")
+    def vae(self):
+        pass
+
+    @vae.command("列表")
+    async def list_vae(self, event: AstrMessageEvent):
+        """列出所有可用的 VAE"""
+        try:
+            vaes = await self._get_vae_list()
+            if not vaes:
+                yield event.plain_result("⚠️ 没有可用的 VAE (或 WebUI 无法访问)")
+                return
+
+            vae_list = "\n".join(f"{i + 1}. {v}" for i, v in enumerate(vaes))
+            yield event.plain_result(f"🎨 可用 VAE 列表:\n{vae_list}")
+        except Exception as e:
+            yield event.plain_result(f"获取 VAE 列表失败: {str(e)}")
+
+    @vae.command("设置")
+    async def set_vae(self, event: AstrMessageEvent, vae_index: int):
+        """根据索引设置 VAE (输入 0 设置为 Automatic)"""
+        try:
+            if int(vae_index) == 0:
+                selected_vae = "Automatic"
+            else:
+                vaes = await self._get_vae_list()
+                if not vaes:
+                    yield event.plain_result("⚠️ 没有可用的 VAE")
+                    return
+
+                index = int(vae_index) - 1
+                if index < 0 or index >= len(vaes):
+                    yield event.plain_result("❌ 无效的 VAE 索引, 请使用 /sd vae list 获取")
+                    return
+                selected_vae = vaes[index]
+
+            self.config["default_params"]["sd_vae"] = selected_vae
+            self.config.save_config()
+            yield event.plain_result(f"✅ 已设置 VAE 为: {selected_vae}")
+        except ValueError:
+            yield event.plain_result("❌ 请输入有效的数字索引 (输入 0 可设为 Automatic)")
+        except Exception as e:
+            yield event.plain_result(f"设置 VAE 失败: {str(e)}")
+
+    # --- 结束新增 VAE 命令组 ---
 
     @sd.command("embedding")
     async def list_embedding(self, event: AstrMessageEvent):

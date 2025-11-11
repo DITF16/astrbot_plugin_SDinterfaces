@@ -31,9 +31,9 @@
     },
     "enable_upscale": {
         "type": "bool",
-        "description": "启用高分辨率处理",
+        "description": "启用 Hires. fix (高分修复)",
         "default": false,
-        "hint": "设置为true时启用"
+        "hint": "设置为true时启用, 将使用 txt2img 接口原生的 Hires. fix 功能"
     },
     "enable_show_positive_prompt": {
         "type": "bool",
@@ -47,16 +47,12 @@
         "default": "",
         "hint": "会自动附加到所有AI生图请求的提示词词组中"
     },
-            
     "enable_positive_prompt_add_in_head_or_tail": {
         "type": "bool",
         "description": "加在头还是加在尾？",
         "default": true,
         "hint": "设置为true时，全局提示词将会附着在用户输入的提示词组的开头，起到最大权重，如定义画风、设置安全等级。否则附着在尾部，权重偏低，适合用于修饰画面、提高出图质量、设定不重要的背景等。根据开关情况，记得在全局提示词的头部或尾部留逗号，免得最终的提示词黏在一起"
-
     },
-    
-
     "negative_prompt_global": {
         "type": "string",
         "description": "全局负面提示词",
@@ -93,8 +89,8 @@
             "sampler": {
                 "type": "string",
                 "description": "采样器",
-                "default": "",
-                "hint": "默认为空，使用 `/sd sampler list` 获取，使用 `/sd sampler set <index>` 设置"
+                "default": "DPM++ 2M Karras",
+                "hint": "默认为 'DPM++ 2M Karras'，使用 `/sd sampler list` 获取，使用 `/sd sampler set <index>` 设置"
             },
             "cfg_scale": {
                 "type": "float",
@@ -103,19 +99,53 @@
                 "min": 1.0,
                 "max": 20.0
             },
+            "seed": {
+                "type": "int",
+                "description": "种子",
+                "default": -1,
+                "hint": "默认为-1 (随机)"
+            },
+            "clip_skip": {
+                "type": "int",
+                "description": "Clip Skip",
+                "default": 2,
+                "hint": "默认为 2，推荐用于动漫模型"
+            },
+            "sd_vae": {
+                "type": "string",
+                "description": "VAE 模型",
+                "default": "Automatic",
+                "hint": "默认为 'Automatic'，使用 `/sd vae list` 获取, `/sd vae set <index>` 设置"
+            },
             "upscaler": {
                 "type": "string",
-                "description": "上采样算法",
-                "default": "",
-                "hint": "默认为空，使用 `/sd upscaler list` 获取，使用 `/sd upscaler set <index>` 设置"
+                "description": "Hires. fix 上采样算法",
+                "default": "Latent",
+                "hint": "默认为 'Latent' (内置安全)。推荐 R-ESRGAN 4x+Anime6b (需自行安装)。使用 `/sd upscaler list` 获取"
             },
             "upscale_factor": {
+                "type": "float",
+                "description": "Hires. fix 放大倍数",
+                "default": 2.0,
+                "min": 1.0,
+                "max": 8.0,
+                "hint": "Hires. fix 放大倍数, 可以是 1.5, 2 等"
+            },
+            "denoising_strength": {
+                "type": "float",
+                "description": "Hires. fix 重绘幅度",
+                "default": 0.4,
+                "min": 0.0,
+                "max": 1.0,
+                "hint": "Hires. fix 的核心参数, 推荐 0.3-0.6"
+            },
+            "hr_second_pass_steps": {
                 "type": "int",
-                "description": "图像放大倍数",
-                "default": 2,
-                "min": 1,
-                "max": 8,
-                "hint": "放大倍数，通常为2、4等"
+                "description": "Hires. fix 修复步数",
+                "default": 10,
+                "min": 0,
+                "max": 100,
+                "hint": "Hires. fix 的第二阶段步数 (0为自动, 等同于 'steps')"
             },
             "batch_size": {
                 "type": "int",
@@ -146,6 +176,5 @@
         "description": "用于替代提示词中空格的字符",
         "default": "~",
         "hint": "因Astrbot底层原因，读取到提示词中的空格时会发生中断，因此需要将所有空格替换为另一个字符来绕开这个限制，在将提示词组送入AI生图软件前，它最终会被重新处理为空格。因此，请在此处填入一个必定不会出现在提示词中的字符，而你在写提示词时，也要将所有的空格都替换为这个字符，此处默认为英文波浪号“~”，且不得为空。"
-        
     }
 }
