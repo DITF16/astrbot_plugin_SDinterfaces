@@ -19,6 +19,10 @@ class SDGenerator(Star):
         self.max_concurrent_tasks = config.get("max_concurrent_tasks", 10)  # 设定最大并发数
         self.task_semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
 
+        # --- 初始化排队号计数器和锁 ---
+        self.queue_counter = 0
+        self.queue_lock = asyncio.Lock()
+
         # 优化：添加资源缓存
         self.resource_cache = {}
 
@@ -316,28 +320,46 @@ class SDGenerator(Star):
         Args:
             prompt: 图像描述提示词
         """
+
+        # --- 获取排队号 ---
+        async with self.queue_lock:
+            self.queue_counter += 1
+            if self.queue_counter > 99999:  # 防止数字无限增大
+                self.queue_counter = 1
+            queue_num = self.queue_counter
+
+        # --- 立即回复排队号 ---
+        # (这会在等待并发信号量之前就发送给用户)
+        try:
+            yield event.plain_result(
+                f"✅ 您已进入队列，排队号：【{queue_num}】\n"
+                f"当前活跃任务: {self.active_tasks}/{self.max_concurrent_tasks}，请等待叫号。")
+        except Exception:
+            # 如果初始回复失败 (例如用户已离开)，则静默处理，但日志中应有记录
+            logger.warning(f"队伍【{queue_num}】: 无法发送初始排队消息。")
+            pass  # 无论如何都继续尝试生成
+
+
         async with self.task_semaphore:
             self.active_tasks += 1
             try:
                 # 检查webui可用性
                 if not (await self._check_webui_available())[0]:
-                    yield event.plain_result("⚠️ 同webui无连接，目前无法生成图片！")
+                    yield event.plain_result(f"⚠️ 队伍【{queue_num}】: 同webui无连接，目前无法生成图片！")
                     return
 
                 verbose = self.config["verbose"]
                 if verbose:
-                    yield event.plain_result("🖌️ 生成图像阶段，这可能需要一段时间...")
+                    yield event.plain_result(f"🖌️ 队伍【{queue_num}】: 开始生成图像，这可能需要一段时间...")
 
                 # 生成提示词
-
                 if self.config.get("enable_generate_prompt"):
                     generated_prompt = await self._generate_prompt(prompt)
-                    logger.debug(f"LLM generated prompt: {generated_prompt}")
+                    logger.debug(f"队伍【{queue_num}】 LLM generated prompt: {generated_prompt}")
                     enable_positive_prompt_add_in_head_or_tail = self.config.get(
                         "enable_positive_prompt_add_in_head_or_tail", True)
                     if enable_positive_prompt_add_in_head_or_tail:
                         positive_prompt = self.config.get("positive_prompt_global", "") + generated_prompt
-
                     else:
                         positive_prompt = generated_prompt + self.config.get("positive_prompt_global", "")
                 else:
@@ -350,7 +372,7 @@ class SDGenerator(Star):
 
                 # 输出正向提示词
                 if self.config.get("enable_show_positive_prompt", False):
-                    yield event.plain_result(f"正向提示词：{positive_prompt}")
+                    yield event.plain_result(f"队伍【{queue_num}】正向提示词：{positive_prompt}")
 
                 # 生成图像 (Hires. fix 已包含在内)
                 response = await self._call_t2i_api(positive_prompt)
@@ -359,41 +381,42 @@ class SDGenerator(Star):
 
                 images = response["images"]
 
-                # 优化：移除 _apply_image_processing 调用
+                # --- 发送图片前的叫号 ---
+                yield event.plain_result(f"✅ 队伍【{queue_num}】的图片已生成：")
 
                 if len(images) == 1:
-                    # [修复] 直接将 API 返回的 base64 字符串传递给 Image.fromBase64
+                    # 直接将 API 返回的 base64 字符串传递给 Image.fromBase64
                     image_data_str = response["images"][0]
                     yield event.chain_result([Image.fromBase64(image_data_str)])
                 else:
                     chain = []
                     for image_data_str in images:
-                        # [修复] 直接将 API 返回的 base64 字符串传递给 Image.fromBase64
+                        # 直接将 API 返回的 base64 字符串传递给 Image.fromBase64
                         chain.append(Image.fromBase64(image_data_str))
                     yield event.chain_result(chain)
 
                 if verbose:
-                    yield event.plain_result("✅ 图像生成成功")
+                    yield event.plain_result(f"✅ 队伍【{queue_num}】: 图像发送完毕。")
 
             except ValueError as e:
                 # 针对API返回异常的处理
-                logger.error(f"API返回数据异常: {e}")
-                yield event.plain_result(f"❌ 图像生成失败: 参数异常，API调用失败")
+                logger.error(f"队伍【{queue_num}】 API返回数据异常: {e}")
+                yield event.plain_result(f"❌ 队伍【{queue_num}】图像生成失败: 参数异常，API调用失败")
 
             except ConnectionError as e:
                 # 网络连接错误处理
-                logger.error(f"网络连接失败: {e}")
-                yield event.plain_result("⚠️ 生成失败! 请检查网络连接和WebUI服务是否运行正常")
+                logger.error(f"队伍【{queue_num}】 网络连接失败: {e}")
+                yield event.plain_result(f"⚠️ 队伍【{queue_num}】生成失败! 请检查网络连接和WebUI服务是否运行正常")
 
             except TimeoutError as e:
                 # 处理超时错误
-                logger.error(f"请求超时: {e}")
-                yield event.plain_result("⚠️ 请求超时，请稍后再试")
+                logger.error(f"队伍【{queue_num}】 请求超时: {e}")
+                yield event.plain_result(f"⚠️ 队伍【{queue_num}】请求超时，请稍后再试")
 
             except Exception as e:
                 # 捕获所有其他异常
-                logger.error(f"生成图像时发生其他错误: {e}")
-                yield event.plain_result(f"❌ 图像生成失败: 发生其他错误，请检查日志")
+                logger.error(f"队伍【{queue_num}】 生成图像时发生其他错误: {e}")
+                yield event.plain_result(f"❌ 队伍【{queue_num}】图像生成失败: 发生其他错误，请检查日志")
             finally:
                 self.active_tasks -= 1
 
@@ -936,7 +959,6 @@ class SDGenerator(Star):
             prompt (string): The prompt or description used for generating images.
         """
         try:
-            # 使用 async for 遍历异步生成器的返回值
             async for result in self.handle_generate_image_command(event, prompt):
                 # 根据生成器的每一个结果返回响应
                 yield result
