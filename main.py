@@ -311,7 +311,7 @@ class SDGenerator(Star):
         yield event.plain_result("✅ 资源缓存已清除。下次列表查询将从 WebUI 重新获取。")
 
     @sd.command("画")
-    async def generate_image(self, event: AstrMessageEvent, prompt: str):
+    async def handle_generate_image_command(self, event: AstrMessageEvent, prompt: str):
         """生成图像指令
         Args:
             prompt: 图像描述提示词
@@ -937,7 +937,7 @@ class SDGenerator(Star):
         """
         try:
             # 使用 async for 遍历异步生成器的返回值
-            async for result in self.generate_image(event, prompt):
+            async for result in self.handle_generate_image_command(event, prompt):
                 # 根据生成器的每一个结果返回响应
                 yield result
 
